@@ -1,0 +1,5 @@
+# 줄바꿈을 LF로 통일한다. Windows/Mac 혼용 시 diff가 깨지는 것을 막는다.
+* text=auto eol=lf
+*.png binary
+*.pdf binary
+*.docx binary
