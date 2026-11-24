@@ -12,6 +12,21 @@ bool elapsed(uint32_t now, uint32_t start, uint32_t duration) {
 
 FlightStateMachine::FlightStateMachine(VehicleRole role) : role_(role) {}
 
+ActuatorChannel FlightStateMachine::primaryChannel() const {
+  // 1단은 CH1 한 발이 분리와 낙하산을 같이 한다. 2단은 CH2 가 낙하산이다.
+  return role_ == VehicleRole::Booster ? ActuatorChannel::Heater1
+                                       : ActuatorChannel::Heater2;
+}
+
+ActuatorChannel FlightStateMachine::backupChannel() const {
+  // 백업 화약을 실제로 장착했을 때만 1단 CH2 를 쓴다.
+  if (role_ == VehicleRole::Booster &&
+      FlightConfig::kBoosterBackupChargeFitted) {
+    return ActuatorChannel::Heater2;
+  }
+  return ActuatorChannel::None;
+}
+
 StateMachineUpdate FlightStateMachine::makeUpdate(
     const SensorSample& sample) const {
   StateMachineUpdate update;
@@ -21,8 +36,8 @@ StateMachineUpdate FlightStateMachine::makeUpdate(
   update.snapshot.reason = reason_;
   update.snapshot.sensor = sample;
   update.snapshot.maxAltitudeM = maxAltitudeM_;
-  update.snapshot.ignitionPermanentlyInhibited =
-      ignitionPermanentlyInhibited_;
+  update.snapshot.separationSeen = separationSeen_;
+  update.snapshot.heaterArmed = heaterArmed_;
   return update;
 }
 
@@ -38,19 +53,13 @@ void FlightStateMachine::transition(StateMachineUpdate& update,
   update.snapshot.state = state_;
   update.snapshot.reason = reason_;
 
-  if (next == FlightState::Launch || next == FlightState::Ride) launchMs_ = nowMs;
-  if (next == FlightState::Separated ||
-      (role_ == VehicleRole::Booster && next == FlightState::Coast)) {
-    separationMs_ = nowMs;
+  if (next == FlightState::Launch || next == FlightState::Ride) {
+    launchMs_ = nowMs;
   }
-  if (next == FlightState::Boost) ignitionMs_ = nowMs;
-  if (next == FlightState::Recovery) ignitionPermanentlyInhibited_ = true;
   if (next == FlightState::Apogee) {
     apogeeMs_ = nowMs;
-    pulseStarted_ = false;
-    secondPulseStarted_ = false;
-    firstPulseStopped_ = false;
-    secondPulseStopped_ = false;
+    deployStep_ = 0;
+    deployStepMs_ = nowMs;
   }
   if (next == FlightState::Deploy) {
     landingWindowStartMs_ = nowMs;
@@ -71,37 +80,50 @@ void FlightStateMachine::commandActuator(StateMachineUpdate& update,
 void FlightStateMachine::resetConfirmationCounters() {
   launchCount_ = 0;
   burnoutCount_ = 0;
-  ignitionCount_ = 0;
   apogeeCount_ = 0;
 }
 
 void FlightStateMachine::updateApogee(StateMachineUpdate& update,
-                                      const SensorSample& sample,
-                                      uint32_t earliestMs,
-                                      uint32_t timeoutMs,
-                                      uint32_t referenceMs) {
-  if (sample.barometerValid &&
-      !elapsed(sample.timestampMs, separationMs_,
-               FlightConfig::kBarometerLockoutMs)) {
-    return;
-  }
+                                      const SensorSample& sample) {
   if (sample.barometerValid) {
     maxAltitudeM_ = std::max(maxAltitudeM_, sample.altitudeM);
   }
-  if (elapsed(sample.timestampMs, referenceMs, timeoutMs)) {
+
+  // 백업 경로. 기압계가 죽어도 반드시 사출한다.
+  if (elapsed(sample.timestampMs, launchMs_,
+              FlightConfig::kApogeeTimeoutFromLaunchMs)) {
     transition(update, FlightState::Apogee, ReasonCode::ApogeeTimeout,
                sample.timestampMs);
     return;
   }
+
   if (!sample.barometerValid) {
+    // 2단 한정 보조 경로. 기압을 못 믿는 상황에서 단간 선이 끊겼다면 1단이
+    // 정점으로 판단해 화약을 쏜 것이므로, 그 시점을 정점으로 받아들인다.
+    if (role_ == VehicleRole::Sustainer && separationSeen_) {
+      transition(update, FlightState::Apogee, ReasonCode::SeparationDetected,
+                 sample.timestampMs);
+    }
     return;
   }
-  if (!elapsed(sample.timestampMs, referenceMs, earliestMs)) {
+
+  // 최소 비행시간 가드. 상승 초반의 압력 요동으로 조기 사출되는 것을 막는다.
+  if (!elapsed(sample.timestampMs, launchMs_,
+               FlightConfig::kApogeeEarliestFromLaunchMs)) {
     apogeeCount_ = 0;
     return;
   }
-  const bool descending = sample.altitudeM <= maxAltitudeM_ - FlightConfig::kApogeeDropM &&
-                          sample.verticalVelocityMps <= 0.0f;
+
+  // 최소 고도 가드. 기체가 제대로 올라간 적이 없으면 기압 기반 정점 판정을
+  // 쓰지 않는다. 발사대 근처에서 화약이 터지는 것을 막는다.
+  if (maxAltitudeM_ < FlightConfig::kMinApogeeAltitudeM) {
+    apogeeCount_ = 0;
+    return;
+  }
+
+  const bool descending =
+      sample.altitudeM <= maxAltitudeM_ - FlightConfig::kApogeeDropM &&
+      sample.verticalVelocityMps <= 0.0f;
   apogeeCount_ = descending ? static_cast<uint8_t>(apogeeCount_ + 1) : 0;
   if (apogeeCount_ >= FlightConfig::kApogeeSamples) {
     transition(update, FlightState::Apogee, ReasonCode::ApogeeDetected,
@@ -109,58 +131,76 @@ void FlightStateMachine::updateApogee(StateMachineUpdate& update,
   }
 }
 
-void FlightStateMachine::updateDeployment(StateMachineUpdate& update,
-                                          const SensorSample& sample) {
-  const uint32_t sinceApogee = sample.timestampMs - apogeeMs_;
-  if (role_ == VehicleRole::Booster) {
-    if (!pulseStarted_) {
-      pulseStarted_ = true;
-      commandActuator(update, ActuatorChannel::Heater1, true,
-                      sample.timestampMs);
+void FlightStateMachine::advanceDeployStep(uint8_t step, uint32_t nowMs) {
+  deployStep_ = step;
+  deployStepMs_ = nowMs;
+}
+
+// 사출 시퀀스
+//   0  2단만: 분리가 끝날 시간을 준다
+//   1  HEAT_ARM 을 올리고 전원이 안정될 때까지 대기
+//   2  주 채널 ON, 펄스 유지
+//   3  주 채널 OFF, 백업이 있으면 간격 대기
+//   4  백업 채널 ON, 펄스 유지
+//   5  백업 채널 OFF
+//   6  HEAT_ARM 내리고 Deploy 로
+//
+// 한 번의 step() 은 액추에이터 명령을 하나만 실어 보낼 수 있으므로 각
+// 단계는 명령을 내고 즉시 반환한다. FSM 주기가 10 ms 라 시퀀스 자체가
+// 늦어지는 양은 무시할 수준이다.
+void FlightStateMachine::runDeploySequence(StateMachineUpdate& update,
+                                           const SensorSample& sample) {
+  const uint32_t now = sample.timestampMs;
+  const uint32_t sinceStep = now - deployStepMs_;
+
+  switch (deployStep_) {
+    case 0:
+      if (role_ == VehicleRole::Sustainer &&
+          sinceStep < FlightConfig::kSustainerDeployDelayMs) {
+        return;
+      }
+      advanceDeployStep(1, now);
+      heaterArmed_ = true;
+      commandActuator(update, ActuatorChannel::CommonArm, true, now);
       return;
-    }
-    if (!firstPulseStopped_ && sinceApogee >= FlightConfig::kPyroPulseMs) {
-      firstPulseStopped_ = true;
-      commandActuator(update, ActuatorChannel::Heater1, false,
-                      sample.timestampMs);
+
+    case 1:
+      if (sinceStep < FlightConfig::kHeaterArmSettleMs) return;
+      advanceDeployStep(2, now);
+      commandActuator(update, primaryChannel(), true, now);
       return;
-    }
-    if (!secondPulseStarted_ && sinceApogee >= FlightConfig::kPyroPulseMs) {
-      secondPulseStarted_ = true;
-      secondPulseStartMs_ = sample.timestampMs;
-      commandActuator(update, ActuatorChannel::Heater2, true,
-                      sample.timestampMs);
+
+    case 2:
+      if (sinceStep < FlightConfig::kPyroPulseMs) return;
+      advanceDeployStep(3, now);
+      commandActuator(update, primaryChannel(), false, now);
       return;
-    }
-    if (!secondPulseStopped_ &&
-        elapsed(sample.timestampMs, secondPulseStartMs_,
-                FlightConfig::kPyroPulseMs)) {
-      secondPulseStopped_ = true;
-      commandActuator(update, ActuatorChannel::Heater2, false,
-                      sample.timestampMs);
+
+    case 3:
+      if (backupChannel() == ActuatorChannel::None) {
+        advanceDeployStep(6, now);
+        return;
+      }
+      if (sinceStep < FlightConfig::kHeaterGapMs) return;
+      advanceDeployStep(4, now);
+      commandActuator(update, backupChannel(), true, now);
       return;
-    }
-    if (secondPulseStopped_) {
-      transition(update, FlightState::Deploy, reason_, sample.timestampMs);
-    }
-  } else {
-    // The supplied PCB has only two heater channels. Heater1 is permanently
-    // reserved for stage-2 ignition; it is never reused for backup deployment.
-    if (!pulseStarted_) {
-      pulseStarted_ = true;
-      commandActuator(update, ActuatorChannel::Heater2, true,
-                      sample.timestampMs);
+
+    case 4:
+      if (sinceStep < FlightConfig::kPyroPulseMs) return;
+      advanceDeployStep(5, now);
+      commandActuator(update, backupChannel(), false, now);
       return;
-    }
-    if (!firstPulseStopped_ && sinceApogee >= FlightConfig::kPyroPulseMs) {
-      firstPulseStopped_ = true;
-      commandActuator(update, ActuatorChannel::Heater2, false,
-                      sample.timestampMs);
+
+    case 5:
+      advanceDeployStep(6, now);
       return;
-    }
-    if (firstPulseStopped_) {
-      transition(update, FlightState::Deploy, reason_, sample.timestampMs);
-    }
+
+    default:
+      heaterArmed_ = false;
+      commandActuator(update, ActuatorChannel::CommonArm, false, now);
+      transition(update, FlightState::Deploy, reason_, now);
+      return;
   }
 }
 
@@ -169,13 +209,22 @@ StateMachineUpdate FlightStateMachine::step(const SensorSample& sample,
   lastSample_ = sample;
   StateMachineUpdate update = makeUpdate(sample);
 
+  // 분리는 한 번 보이면 래치한다. 끊어진 선이 우연히 다시 닿아도 되돌리지
+  // 않는다. 지금 구성에서 분리 신호는 기록용이고, 기압계 고장 시 2단의
+  // 보조 정점 판단에만 쓰인다.
+  if (sample.separationDetected ||
+      command == ControlCommand::BenchSeparationDetected) {
+    if (!separationSeen_) separationMs_ = sample.timestampMs;
+    separationSeen_ = true;
+    lastSample_.separationDetected = true;
+  }
+
   if (command == ControlCommand::Disarm && state_ == FlightState::Armed) {
     transition(update, FlightState::Safe, ReasonCode::None,
                sample.timestampMs);
+    update.snapshot = snapshot();
+    update.snapshot.timestampMs = sample.timestampMs;
     return update;
-  }
-  if (command == ControlCommand::BenchSeparationDetected) {
-    lastSample_.separationDetected = true;
   }
 
   switch (state_) {
@@ -185,12 +234,14 @@ StateMachineUpdate FlightStateMachine::step(const SensorSample& sample,
                    sample.timestampMs);
       }
       break;
+
     case FlightState::Safe:
-      if (command == ControlCommand::BenchArm) {
+      if (command == ControlCommand::Arm) {
         transition(update, FlightState::Armed, ReasonCode::None,
                    sample.timestampMs);
       }
       break;
+
     case FlightState::Armed:
       if (sample.imuValid) {
         launchCount_ = sample.accelerationG >= FlightConfig::kLaunchThresholdG
@@ -205,155 +256,52 @@ StateMachineUpdate FlightStateMachine::step(const SensorSample& sample,
         }
       }
       break;
+
+    // 두 단이 붙어 있으므로 1단과 2단이 같은 연소종료를 본다.
     case FlightState::Launch:
+    case FlightState::Ride:
       if (sample.imuValid &&
           elapsed(sample.timestampMs, launchMs_,
-                  FlightConfig::kBoosterBurnoutEarliestMs)) {
+                  FlightConfig::kBurnoutEarliestMs)) {
         burnoutCount_ = sample.accelerationG <= FlightConfig::kBurnoutThresholdG
                             ? static_cast<uint8_t>(burnoutCount_ + 1)
                             : 0;
       }
       if (burnoutCount_ >= FlightConfig::kBurnoutSamples) {
-        transition(update, FlightState::Separating,
-                   ReasonCode::BurnoutDetected, sample.timestampMs);
+        transition(update, FlightState::Coast, ReasonCode::BurnoutDetected,
+                   sample.timestampMs);
       } else if (elapsed(sample.timestampMs, launchMs_,
-                         FlightConfig::kBoosterBurnoutTimeoutMs)) {
-        transition(update, FlightState::Separating,
-                   ReasonCode::BurnoutTimeout, sample.timestampMs);
-      }
-      break;
-    case FlightState::Separating:
-      if (sample.separationDetected ||
-          command == ControlCommand::BenchSeparationDetected) {
-        transition(update, FlightState::Coast,
-                   ReasonCode::SeparationDetected, sample.timestampMs);
-      } else if (elapsed(sample.timestampMs, launchMs_,
-                         FlightConfig::kSeparationTimeoutFromLaunchMs)) {
-        transition(update, FlightState::Recovery, ReasonCode::NoSeparation,
+                         FlightConfig::kBurnoutTimeoutMs)) {
+        transition(update, FlightState::Coast, ReasonCode::BurnoutTimeout,
                    sample.timestampMs);
       }
       break;
-    case FlightState::Ride:
-      preSeparationAltitudeM_ = sample.altitudeM;
-      if (sample.separationDetected ||
-          command == ControlCommand::BenchSeparationDetected) {
-        transition(update, FlightState::Separated,
-                   ReasonCode::SeparationDetected, sample.timestampMs);
-      } else if (elapsed(sample.timestampMs, launchMs_,
-                         FlightConfig::kSeparationTimeoutFromLaunchMs)) {
-        transition(update, FlightState::Recovery, ReasonCode::NoSeparation,
-                   sample.timestampMs);
-      }
+
+    case FlightState::Coast:
+      updateApogee(update, sample);
       break;
-    case FlightState::Separated: {
-      const uint32_t sinceSep = sample.timestampMs - separationMs_;
-      if (sample.tiltDeg >= FlightConfig::kIgnitionMaxTiltDeg) {
-        transition(update, FlightState::Recovery, ReasonCode::Tilt,
-                   sample.timestampMs);
+
+    case FlightState::Apogee:
+      runDeploySequence(update, sample);
+      break;
+
+    case FlightState::Deploy: {
+      if (!sample.barometerValid) {
+        // 기압이 없으면 고도 변화량이 0 으로 보여 "움직이지 않음 = 착지"로
+        // 오판한다. 창을 계속 초기화해 두고 아래의 절대 타임아웃에만
+        // 의존한다.
+        landingWindowStartMs_ = sample.timestampMs;
+        landingMinAltitudeM_ = sample.altitudeM;
+        landingMaxAltitudeM_ = sample.altitudeM;
+        if (elapsed(sample.timestampMs, apogeeMs_,
+                    FlightConfig::kLandingTimeoutMs)) {
+          transition(update, FlightState::Ground, ReasonCode::LandingTimeout,
+                     sample.timestampMs);
+        }
         break;
       }
-      const bool inWindow = sinceSep >= FlightConfig::kIgnitionWindowOpenMs &&
-                            sinceSep <= FlightConfig::kIgnitionWindowCloseMs;
-      if (inWindow &&
-          sample.integratedVelocityMps > FlightConfig::kIgnitionMinVelocityMps &&
-          preSeparationAltitudeM_ >= FlightConfig::kIgnitionMinAltitudeM) {
-        ignitionPermanentlyInhibited_ = false;
-        ignitionOutputActive_ = true;
-        ignitionCommandMs_ = sample.timestampMs;
-        transition(update, FlightState::Igniting,
-                   ReasonCode::IgnitionCommanded, sample.timestampMs);
-        commandActuator(update, ActuatorChannel::Heater1, true,
-                        sample.timestampMs);
-      } else if (sinceSep > FlightConfig::kIgnitionWindowCloseMs) {
-        const ReasonCode reason =
-            preSeparationAltitudeM_ < FlightConfig::kIgnitionMinAltitudeM
-                ? ReasonCode::LowAltitude
-                : ReasonCode::LowVelocity;
-        transition(update, FlightState::Recovery, reason, sample.timestampMs);
-      }
-      break;
-    }
-    case FlightState::Igniting:
-      if (sample.imuValid) {
-        ignitionCount_ = sample.accelerationG >= FlightConfig::kIgnitionConfirmG
-                             ? static_cast<uint8_t>(ignitionCount_ + 1)
-                             : 0;
-      }
-      if (ignitionCount_ >= FlightConfig::kIgnitionSamples) {
-        ignitionPermanentlyInhibited_ = true;
-        transition(update, FlightState::Boost, ReasonCode::IgnitionDetected,
-                   sample.timestampMs);
-      } else if (elapsed(sample.timestampMs, stateEnteredMs_,
-                         FlightConfig::kIgnitionConfirmTimeoutMs)) {
-        commandActuator(update, ActuatorChannel::Heater1, false,
-                        sample.timestampMs);
-        ignitionOutputActive_ = false;
-        ignitionPermanentlyInhibited_ = true;
-        transition(update, FlightState::Recovery, ReasonCode::NoIgnition,
-                   sample.timestampMs);
-      }
-      break;
-    case FlightState::Boost:
-      if (ignitionOutputActive_ &&
-          elapsed(sample.timestampMs, ignitionCommandMs_,
-                  FlightConfig::kPyroPulseMs)) {
-        commandActuator(update, ActuatorChannel::Heater1, false,
-                        sample.timestampMs);
-        ignitionOutputActive_ = false;
-      }
-      if (sample.imuValid &&
-          elapsed(sample.timestampMs, ignitionMs_,
-                  FlightConfig::kSustainerBurnoutEarliestMs)) {
-        burnoutCount_ = sample.accelerationG <= FlightConfig::kBurnoutThresholdG
-                            ? static_cast<uint8_t>(burnoutCount_ + 1)
-                            : 0;
-      }
-      if (burnoutCount_ >= FlightConfig::kBurnoutSamples) {
-        transition(update, FlightState::Coast, ReasonCode::BoostBurnout,
-                   sample.timestampMs);
-      } else if (elapsed(sample.timestampMs, ignitionMs_,
-                         FlightConfig::kSustainerBurnoutTimeoutMs)) {
-        transition(update, FlightState::Coast, ReasonCode::BoostTimeout,
-                   sample.timestampMs);
-      }
-      break;
-    case FlightState::Coast:
-      if (role_ == VehicleRole::Booster) {
-        updateApogee(update, sample,
-                     FlightConfig::kBoosterApogeeEarliestFromLaunchMs,
-                     FlightConfig::kBoosterApogeeTimeoutFromLaunchMs,
-                     launchMs_);
-      } else {
-        updateApogee(update, sample,
-                     FlightConfig::kSustainerApogeeEarliestFromIgnitionMs,
-                     FlightConfig::kSustainerApogeeTimeoutFromIgnitionMs,
-                     ignitionMs_);
-      }
-      break;
-    case FlightState::Recovery:
-      // Recovery forced-transition times are deliberately not invented. Until
-      // the missing simulations are supplied, only the documented barometric
-      // apogee rule is accepted here.
-      if (sample.barometerValid) {
-        maxAltitudeM_ = std::max(maxAltitudeM_, sample.altitudeM);
-        const bool descending =
-            sample.altitudeM <= maxAltitudeM_ - FlightConfig::kApogeeDropM &&
-            sample.verticalVelocityMps <= 0.0f;
-        apogeeCount_ = descending ? static_cast<uint8_t>(apogeeCount_ + 1) : 0;
-        if (apogeeCount_ >= FlightConfig::kApogeeSamples) {
-          transition(update, FlightState::Apogee,
-                     ReasonCode::ApogeeDetected, sample.timestampMs);
-        }
-      }
-      break;
-    case FlightState::Apogee:
-      updateDeployment(update, sample);
-      break;
-    case FlightState::Deploy: {
-      if (sample.barometerValid) {
-        landingMinAltitudeM_ = std::min(landingMinAltitudeM_, sample.altitudeM);
-        landingMaxAltitudeM_ = std::max(landingMaxAltitudeM_, sample.altitudeM);
-      }
+      landingMinAltitudeM_ = std::min(landingMinAltitudeM_, sample.altitudeM);
+      landingMaxAltitudeM_ = std::max(landingMaxAltitudeM_, sample.altitudeM);
       if (elapsed(sample.timestampMs, landingWindowStartMs_,
                   FlightConfig::kLandingWindowMs)) {
         if (landingMaxAltitudeM_ - landingMinAltitudeM_ <
@@ -366,23 +314,35 @@ StateMachineUpdate FlightStateMachine::step(const SensorSample& sample,
         landingMinAltitudeM_ = sample.altitudeM;
         landingMaxAltitudeM_ = sample.altitudeM;
       }
-      const uint32_t timeout = role_ == VehicleRole::Booster
-                                   ? FlightConfig::kBoosterLandingTimeoutMs
-                                   : FlightConfig::kSustainerLandingTimeoutMs;
-      if (elapsed(sample.timestampMs, apogeeMs_, timeout)) {
+      if (elapsed(sample.timestampMs, apogeeMs_,
+                  FlightConfig::kLandingTimeoutMs)) {
         transition(update, FlightState::Ground, ReasonCode::LandingTimeout,
                    sample.timestampMs);
       }
       break;
     }
+
+    // 지금 구성에서는 진입하지 않는 상태들.
+    case FlightState::Separating:
+    case FlightState::Separated:
+    case FlightState::Igniting:
+    case FlightState::Boost:
+    case FlightState::Recovery:
     case FlightState::Ground:
     case FlightState::Fault:
       break;
   }
 
+  const bool actuatorValid = update.actuatorCommandValid;
+  const ActuatorCommand actuator = update.actuator;
+  const bool stateChanged = update.stateChanged;
+
   update.snapshot = snapshot();
   update.snapshot.timestampMs = sample.timestampMs;
-  update.snapshot.sensor = sample;
+  update.snapshot.sensor = lastSample_;
+  update.stateChanged = stateChanged;
+  update.actuatorCommandValid = actuatorValid;
+  update.actuator = actuator;
   return update;
 }
 
@@ -394,7 +354,8 @@ FlightSnapshot FlightStateMachine::snapshot() const {
   result.reason = reason_;
   result.sensor = lastSample_;
   result.maxAltitudeM = maxAltitudeM_;
-  result.ignitionPermanentlyInhibited = ignitionPermanentlyInhibited_;
+  result.separationSeen = separationSeen_;
+  result.heaterArmed = heaterArmed_;
   return result;
 }
 

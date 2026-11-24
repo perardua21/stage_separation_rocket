@@ -1,11 +1,12 @@
 #pragma once
 
-#include "hal/bench_actuator_output.h"
+#include "hal/actuator_output.h"
 #include "runtime_channels.h"
 
+// 열선 핀을 만지는 유일한 태스크. FSM 은 큐로 요청만 한다.
 class ActuatorTask {
  public:
-  ActuatorTask(RuntimeChannels& channels, BenchActuatorOutput& output)
+  ActuatorTask(RuntimeChannels& channels, IActuatorOutput& output)
       : channels_(channels), output_(output) {}
   bool start(BaseType_t core);
 
@@ -13,5 +14,5 @@ class ActuatorTask {
   static void entry(void* context);
   void run();
   RuntimeChannels& channels_;
-  BenchActuatorOutput& output_;
+  IActuatorOutput& output_;
 };

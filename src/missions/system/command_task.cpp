@@ -19,7 +19,7 @@ void CommandTask::run() {
       if (value == '\n' || value == '\r') {
         line.trim();
         ControlCommand command = ControlCommand::None;
-        if (line.equalsIgnoreCase("arm")) command = ControlCommand::BenchArm;
+        if (line.equalsIgnoreCase("arm")) command = ControlCommand::Arm;
         if (line.equalsIgnoreCase("disarm")) command = ControlCommand::Disarm;
         if (line.equalsIgnoreCase("sep")) {
           command = ControlCommand::BenchSeparationDetected;
