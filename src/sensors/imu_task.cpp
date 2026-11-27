@@ -3,6 +3,11 @@
 #include <Arduino.h>
 #include <math.h>
 
+#if defined(NURA_BENCH_SAFE)
+#include "diagnostics/mount_tilt.h"
+#include "diagnostics/tilt_log_math.h"
+#endif
+
 namespace {
 constexpr uint32_t kPeriodMs = 10;
 constexpr uint32_t kBaselineDurationMs = 10000;
@@ -50,6 +55,20 @@ void ImuTask::run() {
   Vec3 launchVerticalWorld{1.0f, 0.0f, 0.0f};
   bool launchReferenceCaptured = false;
   float integratedVelocityMps = 0.0f;
+#if defined(NURA_BENCH_SAFE)
+  mount_tilt::Window tiltWindow;
+  uint32_t lastTiltSampleMs = baselineStartMs;
+  uint32_t lastTiltWindowMs = baselineStartMs;
+  uint32_t tiltOrientationRxMs = 0;
+  uint32_t tiltEpoch = 0;
+  bool tiltReferenceReady = false;
+  bool tiltReferenceLost = false;
+  bool tiltOrientationValid = false;
+  tilt_log::Quat tiltOrientation{};
+  tilt_log::Vec tiltUp{};
+  // Negative is outside [0, 180] and survives the existing CSV/E22 formats.
+  constexpr float kBenchTiltUnavailable = -1.0f;
+#endif
 
   TickType_t wake = xTaskGetTickCount();
   for (;;) {
@@ -78,23 +97,65 @@ void ImuTask::run() {
 
       const Vec3 acceleration{reading.accelXMps2, reading.accelYMps2,
                               reading.accelZMps2};
+#if defined(NURA_BENCH_SAFE)
+      if (reading.orientationValid && reading.orientationEpoch != tiltEpoch) {
+        tiltEpoch = reading.orientationEpoch;
+        tiltReferenceLost = tiltReferenceLost || tiltReferenceReady;
+        tiltReferenceReady = false;
+        tiltWindow = {};
+      }
+      tiltOrientation = {reading.quaternionW, reading.quaternionX,
+                         reading.quaternionY, reading.quaternionZ};
+      tiltOrientationRxMs = reading.orientationRxMs;
+      tiltOrientationValid = reading.orientationValid &&
+                             tilt_log::normalize(tiltOrientation);
+      tiltWindow.add(acceleration.x, acceleration.y, acceleration.z);
+      lastTiltSampleMs = nowMs;
+#else
       const Vec3 currentAxis =
           normalized(rotate(orientation, {1.0f, 0.0f, 0.0f}));
+#endif
       SensorMessage message;
       message.source = SensorSource::Imu;
       message.timestampMs = reading.sampleMs;
       message.accelerationG = norm(acceleration) / kGravityMps2;
+#if defined(NURA_BENCH_SAFE)
+      const bool tiltFresh = tiltOrientationValid &&
+                             millis() - tiltOrientationRxMs <= 150;
+      message.tiltDeg = tiltReferenceReady && tiltFresh
+                            ? tilt_log::mountAngle(tiltOrientation, tiltUp)
+                            : kBenchTiltUnavailable;
+#else
       message.tiltDeg = launchReferenceCaptured
                             ? acosf(clampUnit(dot(currentAxis,
                                                   launchVerticalWorld))) *
                                   180.0f / PI
                             : 0.0f;
+#endif
       message.integratedVelocityMps = integratedVelocityMps;
       message.valid = reading.orientationValid && launchReferenceCaptured;
       if (xQueueSend(channels_.sensor, &message, 0) != pdTRUE) {
         ++stats_.droppedSensorSamples;
       }
     }
+#if defined(NURA_BENCH_SAFE)
+    if (nowMs - lastTiltWindowMs >= 1000) {
+      lastTiltWindowMs = nowMs;
+      float angleDeg = 0;
+      if (nowMs - lastTiltSampleMs <= 250 && tiltWindow.estimate(angleDeg)) {
+        if (!tiltReferenceReady && !tiltReferenceLost && tiltOrientationValid &&
+            millis() - tiltOrientationRxMs <= 150) {
+          tilt_log::Vec up{tiltWindow.sum[0], tiltWindow.sum[1], tiltWindow.sum[2]};
+          const float length = sqrtf(tilt_log::dot(up, up));
+          up = {up.x / length, up.y / length, up.z / length};
+          tiltUp = tilt_log::rotate(tiltOrientation, up);
+          tiltReferenceReady = true;
+          Serial.println("[IMU] bench vertical reference captured");
+        }
+      }
+      tiltWindow = {};
+    }
+#endif
     vTaskDelayUntil(&wake, pdMS_TO_TICKS(kPeriodMs));
   }
 }

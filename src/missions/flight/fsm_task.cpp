@@ -10,6 +10,18 @@ namespace {
 // 가 비행 중 멈추면 상태머신이 같이 멈춰 정점 판정도, 사출도 일어나지 않는다.
 // 기압계만 살아 있어도 정점 판정과 타임아웃은 돌아가야 한다.
 constexpr uint32_t kImuStaleMs = 200;
+#if defined(NURA_BENCH_SAFE)
+constexpr bool isForwardImuStale(uint32_t barometerMs, uint32_t imuMs) {
+  const uint32_t ageMs = barometerMs - imuMs;
+  // A small backward step appears in the upper half of the millis() range.
+  return ageMs > kImuStaleMs && ageMs < 0x80000000u;
+}
+
+static_assert(!isForwardImuStale(1884u, 1885u));
+static_assert(!isForwardImuStale(1200u, 1000u));
+static_assert(isForwardImuStale(1201u, 1000u));
+static_assert(isForwardImuStale(200u, 0xffffffffu));  // 201 ms across rollover
+#endif
 }  // namespace
 
 bool FsmTask::start(BaseType_t core) {
@@ -22,6 +34,9 @@ void FsmTask::entry(void* context) { static_cast<FsmTask*>(context)->run(); }
 void FsmTask::run() {
   SensorMessage message;
   SensorSample sample;
+#if defined(NURA_BENCH_SAFE)
+  sample.tiltDeg = -1.0f;  // No usable diagnostic tilt yet.
+#endif
   uint32_t lastBarometerMs = 0;
   uint32_t lastImuMs = 0;
   bool imuLossReported = false;
@@ -50,7 +65,11 @@ void FsmTask::run() {
       // IMU 가 한 번도 안 왔으면 아직 부팅 중이다. 그대로 기다린다.
       if (lastImuMs == 0) continue;
       // IMU 가 살아 있으면 상태머신은 IMU 주기로만 돈다.
+#if defined(NURA_BENCH_SAFE)
+      if (!isForwardImuStale(message.timestampMs, lastImuMs)) continue;
+#else
       if (message.timestampMs - lastImuMs <= kImuStaleMs) continue;
+#endif
 
       // 여기부터는 IMU 가 끊긴 경우다. accelerationG 등 IMU 값은 마지막으로
       // 받은 값을 그대로 두고, imuValid 만 내려서 가속도 기반 판정
@@ -58,11 +77,21 @@ void FsmTask::run() {
       // 동작한다.
       if (!imuLossReported) {
         imuLossReported = true;
+#if defined(NURA_BENCH_SAFE)
+        Serial.printf("[FSM] IMU stale: baro=%lu ms, last_imu=%lu ms, diff=%lu ms\n",
+                      static_cast<unsigned long>(message.timestampMs),
+                      static_cast<unsigned long>(lastImuMs),
+                      static_cast<unsigned long>(message.timestampMs - lastImuMs));
+#else
         Serial.printf("[FSM] IMU stale at %lu ms; barometer now driving\n",
                       static_cast<unsigned long>(message.timestampMs));
+#endif
       }
       sample.timestampMs = message.timestampMs;
       sample.imuValid = false;
+#if defined(NURA_BENCH_SAFE)
+      sample.tiltDeg = -1.0f;  // Do not log the cached angle as a fresh sample.
+#endif
     } else {
       lastImuMs = message.timestampMs;
       imuLossReported = false;

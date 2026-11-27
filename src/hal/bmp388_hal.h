@@ -25,4 +25,8 @@ class Bmp388Hal final : public IBarometer {
  private:
   Adafruit_BMP3XX device_;
   uint8_t chipId_ = 0;
+#if defined(NURA_BENCH_SAFE)
+  uint32_t firstSuccessfulReadMs_ = 0;
+  uint8_t discardedStartupSamples_ = 0;
+#endif
 };

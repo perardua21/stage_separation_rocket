@@ -15,6 +15,10 @@ struct Bno085Reading {
   float quaternionY = 0.0f;
   float quaternionZ = 0.0f;
   bool orientationValid = false;
+#if defined(NURA_AXIS_TILT_DIAG) || defined(NURA_BENCH_SAFE)
+  uint32_t orientationRxMs = 0;
+  uint32_t orientationEpoch = 0;
+#endif
 };
 
 class ILowGImu {
@@ -29,10 +33,16 @@ class Bno085Hal final : public ILowGImu {
   Bno085Hal();
   bool begin() override;
   bool read(Bno085Reading& reading, uint32_t nowMs) override;
+#if defined(NURA_AXIS_TILT_DIAG)
+  uint32_t resetCountForLog() const { return resetCount_; }
+#endif
 
  private:
   bool enableReports();
 
   Adafruit_BNO08x device_;
   Bno085Reading latest_;
+#if defined(NURA_AXIS_TILT_DIAG) || defined(NURA_BENCH_SAFE)
+  uint32_t resetCount_ = 0;
+#endif
 };

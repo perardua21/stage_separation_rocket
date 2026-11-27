@@ -1,10 +1,17 @@
 #include "hal/bmp388_hal.h"
 
 #include <Wire.h>
+#include <cmath>
 
 #include "board_pins.h"
 
-namespace { constexpr float kSeaLevelPressureHpa = 1013.25f; }
+namespace {
+constexpr float kSeaLevelPressureHpa = 1013.25f;
+#if defined(NURA_BENCH_SAFE)
+constexpr uint8_t kMinDiscardedStartupSamples = 3;
+constexpr uint32_t kStartupWarmupMs = 750;
+#endif
+}
 
 bool Bmp388Hal::begin() {
   Wire.begin(BoardPins::kBmpSda, BoardPins::kBmpScl, 400000);
@@ -17,14 +24,37 @@ bool Bmp388Hal::begin() {
   device_.setPressureOversampling(BMP3_OVERSAMPLING_8X);
   device_.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
   device_.setOutputDataRate(BMP3_ODR_25_HZ);
+#if defined(NURA_BENCH_SAFE)
+  firstSuccessfulReadMs_ = 0;
+  discardedStartupSamples_ = 0;
+#endif
   return true;
 }
 
 bool Bmp388Hal::read(Bmp388Reading& reading, uint32_t nowMs) {
   if (!device_.performReading()) return false;
+#if defined(NURA_BENCH_SAFE)
+  // Start conversions without publishing the startup readings. A successful
+  // bus read immediately after boot can still contain an initial outlier.
+  if (discardedStartupSamples_ < kMinDiscardedStartupSamples) {
+    if (discardedStartupSamples_ == 0) firstSuccessfulReadMs_ = nowMs;
+    ++discardedStartupSamples_;
+    return false;
+  }
+  if (nowMs - firstSuccessfulReadMs_ < kStartupWarmupMs) return false;
+  if (!std::isfinite(device_.pressure) || device_.pressure <= 0.0f ||
+      !std::isfinite(device_.temperature)) return false;
+#endif
   reading.sampleMs = nowMs;
   reading.pressurePa = device_.pressure;
   reading.temperatureC = device_.temperature;
+#if defined(NURA_BENCH_SAFE)
+  // readAltitude() would trigger another conversion via readPressure().
+  const float pressureHpa = reading.pressurePa / 100.0f;
+  reading.absoluteAltitudeM =
+      44330.0f * (1.0f - std::pow(pressureHpa / kSeaLevelPressureHpa, 0.1903f));
+#else
   reading.absoluteAltitudeM = device_.readAltitude(kSeaLevelPressureHpa);
+#endif
   return true;
 }

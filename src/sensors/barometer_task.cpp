@@ -22,7 +22,7 @@ void BarometerTask::run() {
   const bool ready = barometer_.begin();
 
   // 1) 전원 투입 직후의 초기 영점. 이게 끝날 때까지 기압은 invalid 다.
-  const uint32_t initialStartMs = millis();
+  uint32_t initialStartMs = millis();
   bool haveBaseline = false;
   uint32_t initialSamples = 0;
   float initialSumM = 0.0f;
@@ -68,6 +68,10 @@ void BarometerTask::run() {
       float verticalVelocityMps = 0.0f;
 
       if (!haveBaseline) {
+#if defined(NURA_BENCH_SAFE)
+        // Give the baseline its full window after the HAL startup warmup.
+        if (initialSamples == 0) initialStartMs = reading.sampleMs;
+#endif
         initialSumM += reading.absoluteAltitudeM;
         ++initialSamples;
         if (nowMs - initialStartMs >= kBaselineDurationMs &&

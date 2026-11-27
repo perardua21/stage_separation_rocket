@@ -36,6 +36,9 @@ bool Bno085Hal::enableReports() {
 
 bool Bno085Hal::read(Bno085Reading& reading, uint32_t nowMs) {
   if (device_.wasReset()) {
+#if defined(NURA_AXIS_TILT_DIAG) || defined(NURA_BENCH_SAFE)
+    ++resetCount_;
+#endif
     latest_ = Bno085Reading{};
     if (!enableReports()) return false;
   }
@@ -69,6 +72,10 @@ bool Bno085Hal::read(Bno085Reading& reading, uint32_t nowMs) {
         latest_.quaternionY = event.un.gameRotationVector.j;
         latest_.quaternionZ = event.un.gameRotationVector.k;
         latest_.orientationValid = true;
+#if defined(NURA_AXIS_TILT_DIAG) || defined(NURA_BENCH_SAFE)
+        latest_.orientationRxMs = millis();
+        latest_.orientationEpoch = resetCount_;
+#endif
         break;
       default:
         break;
